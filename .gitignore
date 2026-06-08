@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.xlsx
+*.csv
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
