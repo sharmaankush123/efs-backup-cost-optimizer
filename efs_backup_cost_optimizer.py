@@ -198,7 +198,6 @@ def evaluate_backup(session, region, max_retention_days=None):
                 resource_type = rp.get('ResourceType', 'Unknown')
                 resource_arn = rp.get('ResourceArn', '')
                 creation_date = rp.get('CreationDate', now)
-                completion_date = rp.get('CompletionDate')
                 status = rp.get('Status', 'Unknown')
                 lifecycle = rp.get('Lifecycle', {})
                 delete_after = lifecycle.get('DeleteAfterDays')
@@ -218,13 +217,18 @@ def evaluate_backup(session, region, max_retention_days=None):
                     days_to_expiry = None
                     retention_type = "NEVER (infinite)"
 
+                # Determine storage tier
+                storage_tier = "Warm"
+                if move_to_cold and age_days > move_to_cold:
+                    storage_tier = "Cold"
+
                 issues = []
                 recommendation = "OK"
                 fill = GREEN
 
                 # Check 1: Infinite retention
                 if delete_after is None:
-                    issues.append("INFINITE RETENTION — recovery point will never expire")
+                    issues.append(f"INFINITE RETENTION — recovery point will never expire ({age_days} days old)")
                     recommendation = "REVIEW — SET RETENTION POLICY"
                     fill = ORANGE
 
@@ -240,8 +244,22 @@ def evaluate_backup(session, region, max_retention_days=None):
                     recommendation = "DELETE — EXPIRED"
                     fill = RED
 
+                # Check 4: EFS warm storage dominance (incremental-forever model)
+                # If EFS backup with cold transition configured but still in warm after transition period
+                if resource_type == 'EFS' and move_to_cold and age_days > move_to_cold and storage_tier == "Warm":
+                    issues.append(
+                        f"EFS WARM RETENTION — {age_days} days old, cold transition set at {move_to_cold} days "
+                        "but may remain warm due to EFS incremental-forever model (shared blocks referenced by other recovery points)"
+                    )
+                    if fill == GREEN:
+                        recommendation = "INFO — EFS INCREMENTAL MODEL"
+                        fill = YELLOW
+
                 # Estimate cost (warm: $0.05/GB, cold: $0.01/GB)
-                est_monthly_cost = round(backup_size_gb * 0.05, 2)
+                if storage_tier == "Cold":
+                    est_monthly_cost = round(backup_size_gb * 0.01, 2)
+                else:
+                    est_monthly_cost = round(backup_size_gb * 0.05, 2)
 
                 results.append({
                     'region': region,
@@ -250,10 +268,12 @@ def evaluate_backup(session, region, max_retention_days=None):
                     'resource_type': resource_type,
                     'resource_arn': resource_arn,
                     'status': status,
+                    'storage_tier': storage_tier,
                     'creation_date': creation_date.strftime('%Y-%m-%d') if creation_date else '',
                     'age_days': age_days,
                     'retention_type': retention_type,
                     'delete_after_days': delete_after or 'NEVER',
+                    'move_to_cold_days': move_to_cold or 'N/A',
                     'days_to_expiry': days_to_expiry if days_to_expiry is not None else 'NEVER',
                     'backup_size_gb': backup_size_gb,
                     'est_monthly_cost': est_monthly_cost,
@@ -272,6 +292,15 @@ def calculate_savings(efs_results, backup_results):
     backup_savings_expired = sum(r['est_monthly_cost'] for r in backup_results if r['status'] == 'EXPIRED')
     backup_savings_exceeded = sum(r['est_monthly_cost'] for r in backup_results if 'EXCEEDS' in r['recommendation'])
 
+    # EFS Backup warm vs cold analysis
+    efs_backups = [r for r in backup_results if r['resource_type'] == 'EFS']
+    efs_warm = [r for r in efs_backups if r['storage_tier'] == 'Warm']
+    efs_cold = [r for r in efs_backups if r['storage_tier'] == 'Cold']
+    efs_warm_gb = sum(r['backup_size_gb'] for r in efs_warm)
+    efs_cold_gb = sum(r['backup_size_gb'] for r in efs_cold)
+    total_efs_backup_gb = efs_warm_gb + efs_cold_gb
+    warm_pct = round((efs_warm_gb / total_efs_backup_gb) * 100, 1) if total_efs_backup_gb > 0 else 0
+
     return {
         'efs_lifecycle_savings': efs_savings,
         'efs_unused_savings': sum(r['est_monthly_cost'] for r in efs_results if 'NO MOUNT' in r['recommendation']),
@@ -279,7 +308,12 @@ def calculate_savings(efs_results, backup_results):
         'backup_expired': backup_savings_expired,
         'backup_exceeded_retention': backup_savings_exceeded,
         'total_monthly': efs_savings + backup_savings_expired + backup_savings_exceeded,
-        'total_annual': (efs_savings + backup_savings_expired + backup_savings_exceeded) * 12
+        'total_annual': (efs_savings + backup_savings_expired + backup_savings_exceeded) * 12,
+        'efs_backup_warm_gb': efs_warm_gb,
+        'efs_backup_cold_gb': efs_cold_gb,
+        'efs_backup_warm_pct': warm_pct,
+        'efs_backup_total_rps': len(efs_backups),
+        'efs_backup_infinite_rps': len([r for r in efs_backups if r['retention_type'] == 'NEVER (infinite)'])
     }
 
 
@@ -314,8 +348,9 @@ def write_excel(efs_results, backup_results, savings, regions, max_retention):
 
     # Sheet 2: Backup Assessment
     ws_backup = wb.create_sheet("AWS Backup Optimization")
-    backup_headers = ['Region', 'Vault', 'Resource Type', 'Resource ARN', 'Status', 'Creation Date',
-                      'Age (Days)', 'Retention', 'Days to Expiry', 'Size (GB)', 'Est Monthly Cost ($)',
+    backup_headers = ['Region', 'Vault', 'Resource Type', 'Resource ARN', 'Status', 'Storage Tier',
+                      'Creation Date', 'Age (Days)', 'Retention', 'Move to Cold (Days)',
+                      'Days to Expiry', 'Size (GB)', 'Est Monthly Cost ($)',
                       'Recommendation', 'Issues']
     for col, h in enumerate(backup_headers, 1):
         cell = ws_backup.cell(row=1, column=col, value=h)
@@ -325,7 +360,8 @@ def write_excel(efs_results, backup_results, savings, regions, max_retention):
 
     for row_idx, r in enumerate(backup_results, 2):
         values = [r['region'], r['vault_name'], r['resource_type'], r['resource_arn'], r['status'],
-                  r['creation_date'], r['age_days'], r['retention_type'], r['days_to_expiry'],
+                  r['storage_tier'], r['creation_date'], r['age_days'], r['retention_type'],
+                  r['move_to_cold_days'], r['days_to_expiry'],
                   r['backup_size_gb'], r['est_monthly_cost'], r['recommendation'], r['issues']]
         for col, val in enumerate(values, 1):
             cell = ws_backup.cell(row=row_idx, column=col, value=val)
@@ -352,6 +388,18 @@ def write_excel(efs_results, backup_results, savings, regions, max_retention):
         ("", ""),
         ("TOTAL MONTHLY SAVINGS", f"${savings['total_monthly']:.2f}"),
         ("TOTAL ANNUAL SAVINGS", f"${savings['total_annual']:.2f}"),
+        ("", ""),
+        ("EFS Backup Warm vs Cold Analysis", ""),
+        ("EFS Backup — Warm Storage", f"{savings['efs_backup_warm_gb']:.2f} GB ({savings['efs_backup_warm_pct']}%)"),
+        ("EFS Backup — Cold Storage", f"{savings['efs_backup_cold_gb']:.2f} GB ({100 - savings['efs_backup_warm_pct']:.1f}%)"),
+        ("EFS Backup — Total Recovery Points", str(savings['efs_backup_total_rps'])),
+        ("EFS Backup — Infinite Retention RPs", str(savings['efs_backup_infinite_rps'])),
+        ("", ""),
+        ("NOTE: EFS Incremental-Forever Model", ""),
+        ("", "With daily backups + N-day warm retention, data blocks referenced"),
+        ("", "by ANY warm recovery point cannot transition to cold. This is by-design."),
+        ("", "Only blocks modified/deleted > N days ago AND unreferenced can move to cold."),
+        ("", "High warm % (>90%) is expected with frequent backups and short warm retention."),
         ("", ""),
         ("Parameters", ""),
         ("Regions", ', '.join(regions)),
