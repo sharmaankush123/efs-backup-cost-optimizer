@@ -4,16 +4,15 @@ EFS & AWS Backup Cost Optimizer
 Evaluates EFS file systems and AWS Backup recovery points for cost optimization opportunities.
 
 Usage:
-    python3 efs_backup_cost_optimizer.py <aws-profile> <region> [max-retention-days]
+    python3 efs_backup_cost_optimizer.py <aws-profile> <region(s)> [max-retention-days]
 
 Example:
     python3 efs_backup_cost_optimizer.py default us-east-1
-    python3 efs_backup_cost_optimizer.py production eu-west-1 365
+    python3 efs_backup_cost_optimizer.py production us-east-1,eu-west-1 365
 """
 
 import sys
 import boto3
-import json
 from datetime import datetime, timezone, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -31,6 +30,62 @@ THIN_BORDER = Border(
     left=Side(style='thin'), right=Side(style='thin'),
     top=Side(style='thin'), bottom=Side(style='thin')
 )
+
+# EFS Regional pricing ($/GB-month) per region
+# Source: https://aws.amazon.com/efs/pricing/
+# Pricing varies by throughput mode:
+#   - Elastic Throughput: Standard $0.30, IA $0.016, Archive $0.008 (us-east-1)
+#   - Legacy (Bursting/Provisioned): Standard $0.30, IA $0.025, Archive $0.008 (us-east-1)
+# Format: region -> { 'standard': price, 'ia_elastic': price, 'ia_legacy': price, 'archive': price }
+EFS_PRICING = {
+    'us-east-1': {'standard': 0.30, 'ia_elastic': 0.016, 'ia_legacy': 0.025, 'archive': 0.008},
+    'us-east-2': {'standard': 0.30, 'ia_elastic': 0.016, 'ia_legacy': 0.025, 'archive': 0.008},
+    'us-west-1': {'standard': 0.33, 'ia_elastic': 0.0176, 'ia_legacy': 0.0275, 'archive': 0.0088},
+    'us-west-2': {'standard': 0.30, 'ia_elastic': 0.016, 'ia_legacy': 0.025, 'archive': 0.008},
+    'ca-central-1': {'standard': 0.33, 'ia_elastic': 0.0176, 'ia_legacy': 0.0275, 'archive': 0.0088},
+    'eu-west-1': {'standard': 0.33, 'ia_elastic': 0.0176, 'ia_legacy': 0.0275, 'archive': 0.0088},
+    'eu-west-2': {'standard': 0.348, 'ia_elastic': 0.01856, 'ia_legacy': 0.029, 'archive': 0.00928},
+    'eu-west-3': {'standard': 0.348, 'ia_elastic': 0.01856, 'ia_legacy': 0.029, 'archive': 0.00928},
+    'eu-central-1': {'standard': 0.36, 'ia_elastic': 0.0192, 'ia_legacy': 0.03, 'archive': 0.0096},
+    'eu-central-2': {'standard': 0.396, 'ia_elastic': 0.02112, 'ia_legacy': 0.033, 'archive': 0.01056},
+    'eu-north-1': {'standard': 0.312, 'ia_elastic': 0.01664, 'ia_legacy': 0.026, 'archive': 0.00832},
+    'eu-south-1': {'standard': 0.348, 'ia_elastic': 0.01856, 'ia_legacy': 0.029, 'archive': 0.00928},
+    'ap-southeast-1': {'standard': 0.36, 'ia_elastic': 0.0192, 'ia_legacy': 0.03, 'archive': 0.0096},
+    'ap-southeast-2': {'standard': 0.36, 'ia_elastic': 0.0192, 'ia_legacy': 0.03, 'archive': 0.0096},
+    'ap-southeast-3': {'standard': 0.36, 'ia_elastic': 0.0192, 'ia_legacy': 0.03, 'archive': 0.0096},
+    'ap-northeast-1': {'standard': 0.36, 'ia_elastic': 0.0192, 'ia_legacy': 0.03, 'archive': 0.0096},
+    'ap-northeast-2': {'standard': 0.33, 'ia_elastic': 0.0176, 'ia_legacy': 0.0275, 'archive': 0.0088},
+    'ap-northeast-3': {'standard': 0.36, 'ia_elastic': 0.0192, 'ia_legacy': 0.03, 'archive': 0.0096},
+    'ap-south-1': {'standard': 0.36, 'ia_elastic': 0.0192, 'ia_legacy': 0.03, 'archive': 0.0096},
+    'ap-east-1': {'standard': 0.39, 'ia_elastic': 0.0208, 'ia_legacy': 0.0325, 'archive': 0.0104},
+    'sa-east-1': {'standard': 0.45, 'ia_elastic': 0.024, 'ia_legacy': 0.0375, 'archive': 0.012},
+    'me-south-1': {'standard': 0.396, 'ia_elastic': 0.02112, 'ia_legacy': 0.033, 'archive': 0.01056},
+    'af-south-1': {'standard': 0.396, 'ia_elastic': 0.02112, 'ia_legacy': 0.033, 'archive': 0.01056},
+}
+
+# Fallback pricing for regions not in the map (uses us-east-1 as default)
+DEFAULT_PRICING = {'standard': 0.30, 'ia_elastic': 0.016, 'ia_legacy': 0.025, 'archive': 0.008}
+
+# AWS Backup EFS pricing ($/GB-month)
+BACKUP_PRICING = {
+    'warm': 0.05,
+    'cold': 0.01,
+}
+
+
+def get_efs_pricing(region, throughput_mode):
+    """Get EFS pricing for a region and throughput mode."""
+    pricing = EFS_PRICING.get(region, DEFAULT_PRICING)
+    # Elastic throughput uses lower IA pricing; legacy (bursting/provisioned) uses higher IA pricing
+    if throughput_mode == 'elastic':
+        ia_price = pricing['ia_elastic']
+    else:
+        ia_price = pricing['ia_legacy']
+    return {
+        'standard': pricing['standard'],
+        'ia': ia_price,
+        'archive': pricing['archive'],
+    }
 
 
 def get_session(profile, region):
@@ -55,20 +110,40 @@ def evaluate_efs(session, region):
     for fs in file_systems:
         fs_id = fs['FileSystemId']
         fs_name = next((t['Value'] for t in fs.get('Tags', []) if t['Key'] == 'Name'), fs_id)
-        size_bytes = fs.get('SizeInBytes', {}).get('Value', 0)
-        size_gb = round(size_bytes / (1024**3), 2)
-        creation_time = fs['CreationTime']
-        lifecycle_policies = fs.get('LifeCyclePolicies', [])
+        throughput_mode = fs.get('ThroughputMode', 'bursting')
+
+        # Get per-storage-class sizes from SizeInBytes
+        size_info = fs.get('SizeInBytes', {})
+        total_size_bytes = size_info.get('Value', 0)
+        standard_bytes = size_info.get('ValueInStandard', 0)
+        ia_bytes = size_info.get('ValueInIA', 0)
+        archive_bytes = size_info.get('ValueInArchive', 0)
+
+        total_size_gb = round(total_size_bytes / (1024**3), 2)
+        standard_gb = round(standard_bytes / (1024**3), 2)
+        ia_gb = round(ia_bytes / (1024**3), 2)
+        archive_gb = round(archive_bytes / (1024**3), 2)
+
+        # Get regional pricing based on throughput mode
+        prices = get_efs_pricing(region, throughput_mode)
 
         # Check 1: No mount targets
         mt_response = efs.describe_mount_targets(FileSystemId=fs_id)
         mount_targets = mt_response.get('MountTargets', [])
         has_mount_targets = len(mount_targets) > 0
 
-        # Check 2: Missing lifecycle transition
+        # Check 2: Lifecycle policy — must call describe_lifecycle_configuration
+        # DescribeFileSystems does NOT return lifecycle policies
+        lifecycle_policies = []
+        try:
+            lc_response = efs.describe_lifecycle_configuration(FileSystemId=fs_id)
+            lifecycle_policies = lc_response.get('LifecyclePolicies', [])
+        except Exception:
+            pass
+
         has_lifecycle = len(lifecycle_policies) > 0
         lifecycle_config = ', '.join(
-            f"{p.get('TransitionToIA', p.get('TransitionToPrimaryStorageClass', 'N/A'))}"
+            f"{p.get('TransitionToIA', p.get('TransitionToArchive', p.get('TransitionToPrimaryStorageClass', 'N/A')))}"
             for p in lifecycle_policies
         ) if has_lifecycle else 'NONE'
 
@@ -93,16 +168,14 @@ def evaluate_efs(session, region):
         except Exception:
             pass
 
-        # Check 4: Backup configured (EFS automatic backup or AWS Backup protected resource)
-        efs_backup_enabled = fs.get('Encrypted', False)  # placeholder
+        # Check 4: Backup configured
+        efs_backup_enabled = False
         try:
-            # Check if EFS has automatic backups enabled
             bp = efs.describe_backup_policy(FileSystemId=fs_id)
             efs_backup_enabled = bp.get('BackupPolicy', {}).get('Status') == 'ENABLED'
         except Exception:
-            efs_backup_enabled = False
+            pass
 
-        # Check if under AWS Backup protected resources
         aws_backup_protected = False
         try:
             selections = backup.list_protected_resources()
@@ -115,21 +188,35 @@ def evaluate_efs(session, region):
 
         backup_configured = efs_backup_enabled or aws_backup_protected
 
-        # Determine recommendations
+        # Calculate actual monthly cost using per-storage-class sizes
+        est_monthly_cost = round(
+            (standard_gb * prices['standard']) +
+            (ia_gb * prices['ia']) +
+            (archive_gb * prices['archive']),
+            2
+        )
+
+        # Determine recommendations and savings
         issues = []
         recommendation = "OK"
         fill = GREEN
+        potential_savings = 0.0
 
         if not has_mount_targets:
             issues.append("NO MOUNT TARGETS — filesystem may be unused")
             recommendation = "REVIEW — NO MOUNT TARGETS"
             fill = RED
+            potential_savings = est_monthly_cost  # Delete saves all
 
         if not has_lifecycle:
-            issues.append("NO LIFECYCLE POLICY — missing IA transition (potential 92% savings on infrequent data)")
+            issues.append("NO LIFECYCLE POLICY — missing IA transition (potential savings on Standard-class data)")
             if fill != RED:
                 recommendation = "ADD LIFECYCLE POLICY"
                 fill = ORANGE
+            # Only calculate savings on data currently in Standard storage class
+            # Assume 80% of Standard data could transition to IA
+            if standard_gb > 0:
+                potential_savings = round(standard_gb * 0.80 * (prices['standard'] - prices['ia']), 2)
 
         if size_constant:
             issues.append("SIZE CONSTANT 90 DAYS — no new data written, possible unused filesystem")
@@ -143,20 +230,15 @@ def evaluate_efs(session, region):
                 recommendation = "WARNING — NO BACKUP CONFIGURED"
                 fill = YELLOW
 
-        # Estimated monthly cost (EFS Standard: $0.30/GB, IA: $0.025/GB)
-        est_monthly_cost = round(size_gb * 0.30, 2)
-        potential_savings = 0
-        if not has_lifecycle and size_gb > 0:
-            # Assume 80% could move to IA with lifecycle
-            potential_savings = round(size_gb * 0.80 * (0.30 - 0.025), 2)
-        if not has_mount_targets:
-            potential_savings = est_monthly_cost  # Delete saves all
-
         results.append({
             'region': region,
             'file_system_id': fs_id,
             'name': fs_name,
-            'size_gb': size_gb,
+            'size_gb': total_size_gb,
+            'standard_gb': standard_gb,
+            'ia_gb': ia_gb,
+            'archive_gb': archive_gb,
+            'throughput_mode': throughput_mode,
             'has_mount_targets': has_mount_targets,
             'mount_target_count': len(mount_targets),
             'has_lifecycle': has_lifecycle,
@@ -217,7 +299,7 @@ def evaluate_backup(session, region, max_retention_days=None):
                     days_to_expiry = None
                     retention_type = "NEVER (infinite)"
 
-                # Determine storage tier
+                # Storage tier based on lifecycle setting and age
                 storage_tier = "Warm"
                 if move_to_cold and age_days > move_to_cold:
                     storage_tier = "Cold"
@@ -244,22 +326,11 @@ def evaluate_backup(session, region, max_retention_days=None):
                     recommendation = "DELETE — EXPIRED"
                     fill = RED
 
-                # Check 4: EFS warm storage dominance (incremental-forever model)
-                # If EFS backup with cold transition configured but still in warm after transition period
-                if resource_type == 'EFS' and move_to_cold and age_days > move_to_cold and storage_tier == "Warm":
-                    issues.append(
-                        f"EFS WARM RETENTION — {age_days} days old, cold transition set at {move_to_cold} days "
-                        "but may remain warm due to EFS incremental-forever model (shared blocks referenced by other recovery points)"
-                    )
-                    if fill == GREEN:
-                        recommendation = "INFO — EFS INCREMENTAL MODEL"
-                        fill = YELLOW
-
-                # Estimate cost (warm: $0.05/GB, cold: $0.01/GB)
+                # Estimate cost
                 if storage_tier == "Cold":
-                    est_monthly_cost = round(backup_size_gb * 0.01, 2)
+                    est_monthly_cost = round(backup_size_gb * BACKUP_PRICING['cold'], 2)
                 else:
-                    est_monthly_cost = round(backup_size_gb * 0.05, 2)
+                    est_monthly_cost = round(backup_size_gb * BACKUP_PRICING['warm'], 2)
 
                 results.append({
                     'region': region,
@@ -287,33 +358,30 @@ def evaluate_backup(session, region, max_retention_days=None):
 
 def calculate_savings(efs_results, backup_results):
     """Calculate total potential savings."""
-    efs_savings = sum(r['potential_monthly_savings'] for r in efs_results)
+    # EFS lifecycle savings (only on Standard-class data for filesystems without lifecycle)
+    efs_lifecycle_savings = sum(
+        r['potential_monthly_savings'] for r in efs_results
+        if not r['has_lifecycle'] and r['has_mount_targets']
+    )
+    # EFS unused savings (no mount targets = delete candidate)
+    efs_unused_savings = sum(
+        r['est_monthly_cost'] for r in efs_results if not r['has_mount_targets']
+    )
+
     backup_savings_infinite = sum(r['est_monthly_cost'] for r in backup_results if r['retention_type'] == 'NEVER (infinite)')
     backup_savings_expired = sum(r['est_monthly_cost'] for r in backup_results if r['status'] == 'EXPIRED')
     backup_savings_exceeded = sum(r['est_monthly_cost'] for r in backup_results if 'EXCEEDS' in r['recommendation'])
 
-    # EFS Backup warm vs cold analysis
-    efs_backups = [r for r in backup_results if r['resource_type'] == 'EFS']
-    efs_warm = [r for r in efs_backups if r['storage_tier'] == 'Warm']
-    efs_cold = [r for r in efs_backups if r['storage_tier'] == 'Cold']
-    efs_warm_gb = sum(r['backup_size_gb'] for r in efs_warm)
-    efs_cold_gb = sum(r['backup_size_gb'] for r in efs_cold)
-    total_efs_backup_gb = efs_warm_gb + efs_cold_gb
-    warm_pct = round((efs_warm_gb / total_efs_backup_gb) * 100, 1) if total_efs_backup_gb > 0 else 0
+    total_monthly = efs_lifecycle_savings + efs_unused_savings + backup_savings_expired + backup_savings_exceeded
 
     return {
-        'efs_lifecycle_savings': efs_savings,
-        'efs_unused_savings': sum(r['est_monthly_cost'] for r in efs_results if 'NO MOUNT' in r['recommendation']),
+        'efs_lifecycle_savings': efs_lifecycle_savings,
+        'efs_unused_savings': efs_unused_savings,
         'backup_infinite_retention': backup_savings_infinite,
         'backup_expired': backup_savings_expired,
         'backup_exceeded_retention': backup_savings_exceeded,
-        'total_monthly': efs_savings + backup_savings_expired + backup_savings_exceeded,
-        'total_annual': (efs_savings + backup_savings_expired + backup_savings_exceeded) * 12,
-        'efs_backup_warm_gb': efs_warm_gb,
-        'efs_backup_cold_gb': efs_cold_gb,
-        'efs_backup_warm_pct': warm_pct,
-        'efs_backup_total_rps': len(efs_backups),
-        'efs_backup_infinite_rps': len([r for r in efs_backups if r['retention_type'] == 'NEVER (infinite)'])
+        'total_monthly': total_monthly,
+        'total_annual': total_monthly * 12,
     }
 
 
@@ -324,8 +392,10 @@ def write_excel(efs_results, backup_results, savings, regions, max_retention):
     # Sheet 1: EFS Assessment
     ws_efs = wb.active
     ws_efs.title = "EFS Cost Optimization"
-    efs_headers = ['Region', 'File System ID', 'Name', 'Size (GB)', 'Mount Targets', 'Has Lifecycle',
-                   'Lifecycle Config', 'Size Constant 90d', 'Backup Configured', 'Est Monthly Cost ($)',
+    efs_headers = ['Region', 'File System ID', 'Name', 'Total Size (GB)', 'Standard (GB)',
+                   'IA (GB)', 'Archive (GB)', 'Throughput Mode', 'Mount Targets',
+                   'Has Lifecycle', 'Lifecycle Config', 'Size Constant 90d',
+                   'Backup Configured', 'Est Monthly Cost ($)',
                    'Potential Savings ($/mo)', 'Recommendation', 'Issues']
     for col, h in enumerate(efs_headers, 1):
         cell = ws_efs.cell(row=1, column=col, value=h)
@@ -334,15 +404,17 @@ def write_excel(efs_results, backup_results, savings, regions, max_retention):
         cell.alignment = Alignment(horizontal='center')
 
     for row_idx, r in enumerate(efs_results, 2):
-        values = [r['region'], r['file_system_id'], r['name'], r['size_gb'], r['mount_target_count'],
-                  r['has_lifecycle'], r['lifecycle_config'], r['size_constant_90d'], r['backup_configured'],
-                  r['est_monthly_cost'], r['potential_monthly_savings'], r['recommendation'], r['issues']]
+        values = [r['region'], r['file_system_id'], r['name'], r['size_gb'],
+                  r['standard_gb'], r['ia_gb'], r['archive_gb'], r['throughput_mode'],
+                  r['mount_target_count'], r['has_lifecycle'], r['lifecycle_config'],
+                  r['size_constant_90d'], r['backup_configured'],
+                  r['est_monthly_cost'], r['potential_monthly_savings'],
+                  r['recommendation'], r['issues']]
         for col, val in enumerate(values, 1):
             cell = ws_efs.cell(row=row_idx, column=col, value=val)
             cell.fill = r['fill']
             cell.border = THIN_BORDER
 
-    # Auto-width
     for col in range(1, len(efs_headers) + 1):
         ws_efs.column_dimensions[get_column_letter(col)].width = 18
 
@@ -373,14 +445,14 @@ def write_excel(efs_results, backup_results, savings, regions, max_retention):
 
     # Sheet 3: Cost Savings Summary
     ws_savings = wb.create_sheet("Cost Savings Summary")
-    ws_savings.column_dimensions['A'].width = 40
-    ws_savings.column_dimensions['B'].width = 20
+    ws_savings.column_dimensions['A'].width = 45
+    ws_savings.column_dimensions['B'].width = 25
 
     summary_data = [
         ("Cost Savings Summary", ""),
         ("", ""),
         ("Category", "Monthly Savings ($)"),
-        ("EFS — Add Lifecycle Policy (IA transition)", f"${savings['efs_lifecycle_savings']:.2f}"),
+        ("EFS — Add Lifecycle Policy (IA transition on Standard data)", f"${savings['efs_lifecycle_savings']:.2f}"),
         ("EFS — Delete Unused Filesystems (no mount targets)", f"${savings['efs_unused_savings']:.2f}"),
         ("Backup — Delete Expired Recovery Points", f"${savings['backup_expired']:.2f}"),
         ("Backup — Delete Over-Retained Recovery Points", f"${savings['backup_exceeded_retention']:.2f}"),
@@ -389,22 +461,15 @@ def write_excel(efs_results, backup_results, savings, regions, max_retention):
         ("TOTAL MONTHLY SAVINGS", f"${savings['total_monthly']:.2f}"),
         ("TOTAL ANNUAL SAVINGS", f"${savings['total_annual']:.2f}"),
         ("", ""),
-        ("EFS Backup Warm vs Cold Analysis", ""),
-        ("EFS Backup — Warm Storage", f"{savings['efs_backup_warm_gb']:.2f} GB ({savings['efs_backup_warm_pct']}%)"),
-        ("EFS Backup — Cold Storage", f"{savings['efs_backup_cold_gb']:.2f} GB ({100 - savings['efs_backup_warm_pct']:.1f}%)"),
-        ("EFS Backup — Total Recovery Points", str(savings['efs_backup_total_rps'])),
-        ("EFS Backup — Infinite Retention RPs", str(savings['efs_backup_infinite_rps'])),
-        ("", ""),
-        ("NOTE: EFS Incremental-Forever Model", ""),
-        ("", "With daily backups + N-day warm retention, data blocks referenced"),
-        ("", "by ANY warm recovery point cannot transition to cold. This is by-design."),
-        ("", "Only blocks modified/deleted > N days ago AND unreferenced can move to cold."),
-        ("", "High warm % (>90%) is expected with frequent backups and short warm retention."),
-        ("", ""),
         ("Parameters", ""),
         ("Regions", ', '.join(regions)),
         ("Max Retention (days)", str(max_retention) if max_retention else "Not specified"),
-        ("Run Date", datetime.now().strftime('%Y-%m-%d %H:%M UTC')),
+        ("Run Date", datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')),
+        ("", ""),
+        ("Notes", ""),
+        ("", "EFS lifecycle savings are calculated only on data currently in Standard storage class."),
+        ("", "Cost estimates use region-specific pricing and per-filesystem throughput mode."),
+        ("", "Savings assume 80% of Standard-class data would transition to IA with a lifecycle policy."),
     ]
 
     for row_idx, (label, value) in enumerate(summary_data, 1):

@@ -9,7 +9,7 @@ This tool evaluates **Amazon EFS file systems** and **AWS Backup recovery points
 | # | Check | Issue Detected | Recommendation |
 |---|-------|----------------|----------------|
 | 1 | **No Mount Targets** | File system has no mount points — likely unused | Delete filesystem or investigate |
-| 2 | **Missing Lifecycle Policy** | No IA transition configured | Add lifecycle policy (save up to 92% on infrequent data) |
+| 2 | **Missing Lifecycle Policy** | No IA transition configured | Add lifecycle policy (save up to 95% on Standard-class data) |
 | 3 | **Size Constant 90 Days** | No data written in 90 days — possibly abandoned | Review usage, consider deletion |
 | 4 | **No Backup Configured** | Neither EFS automatic backup nor AWS Backup protection | Enable backup or document risk acceptance |
 
@@ -72,13 +72,17 @@ This tool evaluates **Amazon EFS file systems** and **AWS Backup recovery points
 
 ## EFS Cost Context
 
-| Storage Class | Price ($/GB-month) | Use Case |
-|---------------|-------------------|----------|
-| EFS Standard | $0.30 | Frequently accessed data |
-| EFS Infrequent Access (IA) | $0.025 | Data accessed < once/month |
-| EFS Archive | $0.008 | Data accessed few times/year |
+Pricing varies by region and throughput mode. Example for US East (N. Virginia):
 
-**Lifecycle policies can save up to 92%** by automatically moving infrequent data to IA/Archive tiers.
+| Storage Class | Elastic Throughput ($/GB-month) | Legacy Throughput ($/GB-month) | Use Case |
+|---------------|-------------------------------|-------------------------------|----------|
+| EFS Standard | $0.30 | $0.30 | Frequently accessed data |
+| EFS Infrequent Access (IA) | $0.016 | $0.025 | Data accessed < once/quarter |
+| EFS Archive | $0.008 | $0.008 | Data accessed few times/year |
+
+**Lifecycle policies can save up to 95%** by automatically moving infrequent data to IA/Archive tiers.
+
+The tool uses region-specific pricing and accounts for the filesystem's throughput mode (Elastic vs Bursting/Provisioned).
 
 ## AWS Backup Cost Context
 
@@ -97,6 +101,7 @@ This tool evaluates **Amazon EFS file systems** and **AWS Backup recovery points
 - IAM permissions:
   - `elasticfilesystem:DescribeFileSystems`
   - `elasticfilesystem:DescribeMountTargets`
+  - `elasticfilesystem:DescribeLifecycleConfiguration`
   - `elasticfilesystem:DescribeBackupPolicy`
   - `cloudwatch:GetMetricStatistics`
   - `backup:ListBackupVaults`
@@ -133,7 +138,7 @@ python3 efs_backup_cost_optimizer.py default us-east-1,eu-west-1 365
 
 The script generates an **Excel file (.xlsx)** with three sheets:
 
-1. **EFS Cost Optimization** — per-filesystem assessment (colour-coded)
+1. **EFS Cost Optimization** — per-filesystem assessment with per-storage-class breakdown (colour-coded)
 2. **AWS Backup Optimization** — per-recovery-point assessment (colour-coded)
 3. **Cost Savings Summary** — total potential savings if recommendations are applied
 
@@ -176,7 +181,7 @@ Summary:
 ## Common Scenarios
 
 ### Scenario 1: EFS without Lifecycle Policy
-A 500 GB EFS filesystem with no lifecycle policy pays $150/month. If 80% of data is infrequently accessed, adding a lifecycle policy reduces cost to ~$40/month (**$110/month savings**).
+A 500 GB EFS filesystem with all data in Standard storage and no lifecycle policy pays $150/month. If 80% of data is infrequently accessed, adding a lifecycle policy reduces cost to ~$40/month (**$110/month savings**).
 
 ### Scenario 2: Infinite Retention Backups
 An account with 200 recovery points set to "never expire" accumulates ~$500/month in storage costs that grows every backup cycle. Setting a 90-day retention and deleting old points saves immediately.
